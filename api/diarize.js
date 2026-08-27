@@ -6,6 +6,7 @@ const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
+const { Buffer } = require('buffer');
 
 const FUNCTION_ID = '1598d209-5e27-4d3c-8079-4751568b1081'; // nvidia/parakeet-ctc-riva-1-1b
 const SERVER = 'grpc.nvcf.nvidia.com:443';
@@ -28,32 +29,47 @@ function loadRivaProto() {
   return cachedRivaProto;
 }
 
-// Remuxes WebM/Opus (what MediaRecorder produces in the browser) into an
-// Ogg/Opus container (what Riva's OGGOPUS encoding expects). Stream copy only
-// — no re-encoding, so it's fast and lossless.
-function remuxWebmToOgg(webmBuffer) {
+function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const tmpDir = os.tmpdir();
-    const id = crypto.randomBytes(8).toString('hex');
-    const inPath = path.join(tmpDir, `${id}.webm`);
-    const outPath = path.join(tmpDir, `${id}.ogg`);
-    fs.writeFile(inPath, webmBuffer, (writeErr) => {
-      if (writeErr) return reject(writeErr);
-      const proc = spawn(ffmpegPath, ['-y', '-i', inPath, '-c:a', 'copy', '-f', 'ogg', outPath]);
-      let stderr = '';
-      proc.stderr.on('data', (d) => (stderr += d));
-      proc.on('close', (code) => {
-        fs.unlink(inPath, () => {});
-        if (code !== 0) return reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-500)}`));
-        fs.readFile(outPath, (readErr, oggBuffer) => {
-          fs.unlink(outPath, () => {});
-          if (readErr) return reject(readErr);
-          resolve(oggBuffer);
-        });
-      });
-      proc.on('error', reject);
+    const proc = spawn(ffmpegPath, args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => (stderr += d));
+    proc.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-800)}`));
+      resolve();
     });
+    proc.on('error', reject);
   });
+}
+
+// Joins the calibration clip (tutor speaking alone) in front of the actual
+// chunk, re-encoding both into a single Ogg/Opus stream so Riva sees one
+// continuous recording. Re-encoding (not stream-copy) is required for concat.
+async function concatToOgg(calibrationBuffer, chunkBuffer) {
+  const tmpDir = os.tmpdir();
+  const id = crypto.randomBytes(8).toString('hex');
+  const calPath = path.join(tmpDir, `${id}-cal.webm`);
+  const chunkPath = path.join(tmpDir, `${id}-chunk.webm`);
+  const outPath = path.join(tmpDir, `${id}-out.ogg`);
+  await fs.promises.writeFile(calPath, calibrationBuffer);
+  await fs.promises.writeFile(chunkPath, chunkBuffer);
+  try {
+    await runFfmpeg([
+      '-y',
+      '-i', calPath,
+      '-i', chunkPath,
+      '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[out]',
+      '-map', '[out]',
+      '-c:a', 'libopus',
+      '-f', 'ogg',
+      outPath,
+    ]);
+    return await fs.promises.readFile(outPath);
+  } finally {
+    fs.promises.unlink(calPath).catch(() => {});
+    fs.promises.unlink(chunkPath).catch(() => {});
+    fs.promises.unlink(outPath).catch(() => {});
+  }
 }
 
 function recognize({ apiKey, audioBytes, maxSpeakers }) {
@@ -92,40 +108,90 @@ function recognize({ apiKey, audioBytes, maxSpeakers }) {
   });
 }
 
-// Merges consecutive same-speaker words into readable segments.
-function toSegments(response) {
-  const segments = [];
-  let current = null;
+// Flattens the response into a single word list across all results.
+function allWords(response) {
+  const words = [];
   for (const result of response.results || []) {
     const alt = result.alternatives && result.alternatives[0];
     if (!alt || !alt.words) continue;
     for (const w of alt.words) {
-      const tag = w.speaker_tag;
-      if (!current || current.speaker !== tag) {
-        current = { speaker: tag, text: w.word, startMs: Number(w.start_time) };
-        segments.push(current);
-      } else {
-        current.text += ' ' + w.word;
-      }
-      current.endMs = Number(w.end_time);
+      words.push({ word: w.word, speaker_tag: w.speaker_tag, startMs: Number(w.start_time), endMs: Number(w.end_time) });
     }
   }
-  return segments;
+  return words;
 }
 
-function readRawBody(req) {
+// Words up to ~calibrationMs belong to the calibration clip. Whichever
+// speaker tag dominates that window is the tutor; everything after is
+// relabeled tutor/student and re-based to start at 0 for the real chunk.
+function splitAndLabel(words, calibrationMs) {
+  const tallyBuffer = 400; // ms of slack, generous on purpose — only used to identify the tutor's tag
+  const dropBuffer = -150; // when actually cutting the calibration clip out, err toward keeping real speech
+  const calWords = words.filter((w) => w.startMs < calibrationMs + tallyBuffer);
+  const tally = {};
+  for (const w of calWords) tally[w.speaker_tag] = (tally[w.speaker_tag] || 0) + 1;
+  let tutorTag = null;
+  let best = -1;
+  for (const [tag, count] of Object.entries(tally)) {
+    if (count > best) { best = count; tutorTag = Number(tag); }
+  }
+
+  const segments = [];
+  let current = null;
+  for (const w of words) {
+    if (w.startMs < calibrationMs + dropBuffer) continue; // drop calibration audio itself
+    const role = w.speaker_tag === tutorTag ? 'tutor' : 'student';
+    const startMs = Math.max(0, w.startMs - calibrationMs);
+    const endMs = Math.max(0, w.endMs - calibrationMs);
+    if (!current || current.role !== role) {
+      current = { role, text: w.word, startMs };
+      segments.push(current);
+    } else {
+      current.text += ' ' + w.word;
+    }
+    current.endMs = endMs;
+  }
+  return { segments, tutorTagFound: tutorTag !== null };
+}
+
+function readMultipart(req) {
   return new Promise((resolve, reject) => {
+    const contentType = req.headers['content-type'] || '';
+    const match = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+    if (!match) return reject(new Error('missing multipart boundary'));
+    const boundary = '--' + (match[1] || match[2]).trim();
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const parts = {};
+      let start = body.indexOf(boundary);
+      while (start !== -1) {
+        const next = body.indexOf(boundary, start + boundary.length);
+        if (next === -1) break;
+        const partBuf = body.slice(start + boundary.length, next);
+        const headerEnd = partBuf.indexOf('\r\n\r\n');
+        if (headerEnd !== -1) {
+          const headerText = partBuf.slice(0, headerEnd).toString('utf8');
+          const nameMatch = headerText.match(/name="([^"]+)"/i);
+          if (nameMatch) {
+            let data = partBuf.slice(headerEnd + 4);
+            if (data.slice(-2).toString() === '\r\n') data = data.slice(0, -2);
+            parts[nameMatch[1]] = data;
+          }
+        }
+        start = next;
+      }
+      resolve(parts);
+    });
   });
 }
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Nvidia-Api-Key, X-Max-Speakers');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Nvidia-Api-Key, X-Max-Speakers, X-Calibration-Duration-Ms');
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
@@ -136,15 +202,23 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'X-Nvidia-Api-Key header is required' });
     }
 
-    const webmBuffer = Buffer.isBuffer(req.body) ? req.body : await readRawBody(req);
-    if (!webmBuffer || webmBuffer.length === 0) {
-      return res.status(400).json({ error: 'empty audio body' });
+    const parts = await readMultipart(req);
+    const calibration = parts.calibration;
+    const chunk = parts.chunk;
+    if (!calibration || !calibration.length) return res.status(400).json({ error: "missing 'calibration' part" });
+    if (!chunk || !chunk.length) return res.status(400).json({ error: "missing 'chunk' part" });
+
+    const calibrationMsHeader = parseInt(req.headers['x-calibration-duration-ms'], 10);
+    if (!calibrationMsHeader) {
+      return res.status(400).json({ error: 'X-Calibration-Duration-Ms header is required' });
     }
 
-    const oggBuffer = await remuxWebmToOgg(webmBuffer);
+    const oggBuffer = await concatToOgg(calibration, chunk);
     const response = await recognize({ apiKey, audioBytes: oggBuffer, maxSpeakers });
-    const segments = toSegments(response);
-    return res.status(200).json({ segments });
+    const words = allWords(response);
+    const { segments, tutorTagFound } = splitAndLabel(words, calibrationMsHeader);
+
+    return res.status(200).json({ segments, tutorTagFound });
   } catch (err) {
     const code = err && err.code;
     const message = (err && err.message) || String(err);
