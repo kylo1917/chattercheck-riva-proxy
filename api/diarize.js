@@ -180,20 +180,15 @@ function readMultipart(req) {
   });
 }
 
-const ALLOWED_ORIGINS = new Set([
-  'https://kylo1917.github.io',
-]);
+const { enforceOrigin, rateLimited } = require('./_shared');
 
 module.exports = async (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
-  res.setHeader('Vary', 'Origin');
+  if (!enforceOrigin(req, res)) return;
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Nvidia-Api-Key, X-Max-Speakers, X-Calibration-Duration-Ms');
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
+  if (rateLimited(req)) return res.status(429).json({ error: 'Too many requests — slow down a little' });
 
   try {
     const apiKey = req.headers['x-nvidia-api-key'];
