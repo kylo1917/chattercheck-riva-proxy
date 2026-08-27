@@ -1,4 +1,9 @@
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 
@@ -9,7 +14,7 @@ let cachedRivaProto = null;
 function loadRivaProto() {
   if (cachedRivaProto) return cachedRivaProto;
   const packageDefinition = protoLoader.loadSync(
-    path.join(__dirname, '..', 'proto/riva/proto/riva_asr.proto'),
+    path.join(__dirname, '..', 'proto', 'riva', 'proto', 'riva_asr.proto'),
     {
       keepCase: true,
       longs: String,
@@ -21,6 +26,34 @@ function loadRivaProto() {
   );
   cachedRivaProto = grpc.loadPackageDefinition(packageDefinition).nvidia.riva.asr;
   return cachedRivaProto;
+}
+
+// Remuxes WebM/Opus (what MediaRecorder produces in the browser) into an
+// Ogg/Opus container (what Riva's OGGOPUS encoding expects). Stream copy only
+// — no re-encoding, so it's fast and lossless.
+function remuxWebmToOgg(webmBuffer) {
+  return new Promise((resolve, reject) => {
+    const tmpDir = os.tmpdir();
+    const id = crypto.randomBytes(8).toString('hex');
+    const inPath = path.join(tmpDir, `${id}.webm`);
+    const outPath = path.join(tmpDir, `${id}.ogg`);
+    fs.writeFile(inPath, webmBuffer, (writeErr) => {
+      if (writeErr) return reject(writeErr);
+      const proc = spawn(ffmpegPath, ['-y', '-i', inPath, '-c:a', 'copy', '-f', 'ogg', outPath]);
+      let stderr = '';
+      proc.stderr.on('data', (d) => (stderr += d));
+      proc.on('close', (code) => {
+        fs.unlink(inPath, () => {});
+        if (code !== 0) return reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-500)}`));
+        fs.readFile(outPath, (readErr, oggBuffer) => {
+          fs.unlink(outPath, () => {});
+          if (readErr) return reject(readErr);
+          resolve(oggBuffer);
+        });
+      });
+      proc.on('error', reject);
+    });
+  });
 }
 
 function recognize({ apiKey, audioBytes, maxSpeakers }) {
@@ -38,8 +71,8 @@ function recognize({ apiKey, audioBytes, maxSpeakers }) {
     const client = new rivaProto.RivaSpeechRecognition(SERVER, creds);
     const request = {
       config: {
-        encoding: 1, // LINEAR_PCM
-        sample_rate_hertz: 16000,
+        encoding: 4, // OGGOPUS
+        sample_rate_hertz: 48000,
         language_code: 'en-US',
         max_alternatives: 1,
         enable_automatic_punctuation: true,
@@ -80,34 +113,41 @@ function toSegments(response) {
   return segments;
 }
 
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Nvidia-Api-Key, X-Max-Speakers');
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
   try {
-    const { apiKey, audioBase64, maxSpeakers } = req.body || {};
+    const apiKey = req.headers['x-nvidia-api-key'];
+    const maxSpeakers = parseInt(req.headers['x-max-speakers'], 10) || 2;
     if (!apiKey || typeof apiKey !== 'string') {
-      return res.status(400).json({ error: 'apiKey is required' });
-    }
-    if (!audioBase64 || typeof audioBase64 !== 'string') {
-      return res.status(400).json({ error: 'audioBase64 is required' });
-    }
-    // audioBase64 must be raw 16-bit mono 16kHz PCM (no WAV header), base64-encoded.
-    const audioBytes = Buffer.from(audioBase64, 'base64');
-    if (audioBytes.length === 0) {
-      return res.status(400).json({ error: 'decoded audio is empty' });
+      return res.status(400).json({ error: 'X-Nvidia-Api-Key header is required' });
     }
 
-    const response = await recognize({ apiKey, audioBytes, maxSpeakers });
+    const webmBuffer = Buffer.isBuffer(req.body) ? req.body : await readRawBody(req);
+    if (!webmBuffer || webmBuffer.length === 0) {
+      return res.status(400).json({ error: 'empty audio body' });
+    }
+
+    const oggBuffer = await remuxWebmToOgg(webmBuffer);
+    const response = await recognize({ apiKey, audioBytes: oggBuffer, maxSpeakers });
     const segments = toSegments(response);
     return res.status(200).json({ segments });
   } catch (err) {
     const code = err && err.code;
     const message = (err && err.message) || String(err);
-    // gRPC UNAUTHENTICATED / PERMISSION_DENIED
     if (code === 16 || code === 7) {
       return res.status(401).json({ error: 'NVIDIA API key rejected', detail: message });
     }
@@ -115,6 +155,12 @@ module.exports = async (req, res) => {
       return res.status(429).json({ error: 'Rate limited by NVIDIA — try again shortly', detail: message });
     }
     console.error('diarize error:', message);
-    return res.status(502).json({ error: 'Upstream Riva request failed', detail: message });
+    return res.status(502).json({ error: 'Upstream request failed', detail: message });
   }
+};
+
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
 };
