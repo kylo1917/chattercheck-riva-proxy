@@ -7,6 +7,7 @@ const ffmpegPath = require('ffmpeg-static');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const { Buffer } = require('buffer');
+const Busboy = require('busboy');
 
 const FUNCTION_ID = '1598d209-5e27-4d3c-8079-4751568b1081'; // nvidia/parakeet-ctc-riva-1-1b
 const SERVER = 'grpc.nvcf.nvidia.com:443';
@@ -156,35 +157,26 @@ function splitAndLabel(words, calibrationMs) {
 
 function readMultipart(req) {
   return new Promise((resolve, reject) => {
-    const contentType = req.headers['content-type'] || '';
-    const match = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
-    if (!match) return reject(new Error('missing multipart boundary'));
-    const boundary = '--' + (match[1] || match[2]).trim();
-    const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('error', reject);
-    req.on('end', () => {
-      const body = Buffer.concat(chunks);
-      const parts = {};
-      let start = body.indexOf(boundary);
-      while (start !== -1) {
-        const next = body.indexOf(boundary, start + boundary.length);
-        if (next === -1) break;
-        const partBuf = body.slice(start + boundary.length, next);
-        const headerEnd = partBuf.indexOf('\r\n\r\n');
-        if (headerEnd !== -1) {
-          const headerText = partBuf.slice(0, headerEnd).toString('utf8');
-          const nameMatch = headerText.match(/name="([^"]+)"/i);
-          if (nameMatch) {
-            let data = partBuf.slice(headerEnd + 4);
-            if (data.slice(-2).toString() === '\r\n') data = data.slice(0, -2);
-            parts[nameMatch[1]] = data;
-          }
-        }
-        start = next;
-      }
-      resolve(parts);
+    let bb;
+    try {
+      bb = Busboy({ headers: req.headers });
+    } catch (e) {
+      return reject(e);
+    }
+    const parts = {};
+    bb.on('file', (name, stream) => {
+      const chunks = [];
+      stream.on('data', (c) => chunks.push(c));
+      stream.on('end', () => {
+        parts[name] = Buffer.concat(chunks);
+      });
     });
+    bb.on('field', (name, value) => {
+      parts[name] = value;
+    });
+    bb.on('error', reject);
+    bb.on('finish', () => resolve(parts));
+    req.pipe(bb);
   });
 }
 
