@@ -9,7 +9,7 @@ const protoLoader = require('@grpc/proto-loader');
 const { Buffer } = require('buffer');
 const Busboy = require('busboy');
 
-const FUNCTION_ID = '1598d209-5e27-4d3c-8079-4751568b1081'; // nvidia/parakeet-ctc-riva-1-1b
+const FUNCTION_ID = 'd3fe9151-442b-4204-a70d-5fcc597fd610'; // nvidia/parakeet-tdt-0.6b-v2 — better accuracy than the earlier CTC 1.1B model, confirmed diarization-compatible before switching
 const SERVER = 'grpc.nvcf.nvidia.com:443';
 
 let cachedRivaProto = null;
