@@ -1,5 +1,10 @@
 const ALLOWED_ORIGINS = new Set([
   'https://kylo1917.github.io',
+  // The desktop app (Tauri) serves the same page from its own custom
+  // scheme instead of a normal https origin — differs by platform.
+  'tauri://localhost',
+  'http://tauri.localhost',
+  'https://tauri.localhost',
 ]);
 
 // Sets CORS headers for browser callers, and returns whether this request is
