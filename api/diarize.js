@@ -244,7 +244,12 @@ module.exports = async (req, res) => {
     if (words.length) {
       ({ segments, tutorTagFound } = splitAndLabel(words, calibrationMsHeader));
     } else {
-      segments = allResultsText(response).map((text) => ({ role: null, text }));
+      // 'unknown' (not null) matters: the client's live view hides lines with
+      // no role and no flagged tag by default, treating them as probable
+      // noise from raw speech-recognition fragments — but this text came
+      // back from a real Riva call and deserves to be shown, just without a
+      // speaker label attached.
+      segments = allResultsText(response).map((text) => ({ role: 'unknown', text }));
       tutorTagFound = false;
     }
 
