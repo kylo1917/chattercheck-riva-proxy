@@ -44,16 +44,19 @@ function runFfmpeg(args) {
 }
 
 // Chrome sends WebM/Opus, but WebKit-based browsers (including the desktop
-// app) can't produce that container, so the client now says what it
-// actually sent. Naming the temp file with the right extension and forcing
-// ffmpeg's demuxer via -f matters: guessing wrong made ffmpeg exit cleanly
-// but silently produce a zero-sample output, which Riva then rejected with
-// an opaque "0 time steps" error instead of a clear failure.
+// app) can't produce that container, so the client says what it actually
+// sent when it knows. Forcing ffmpeg's demuxer via -f based on a WRONG
+// guess is worse than not forcing it at all — it makes ffmpeg exit cleanly
+// but silently produce a zero-sample output (Riva then rejects that with an
+// opaque "0 time steps" error). So format is null, not a guess, whenever
+// the client doesn't know either, and ffmpeg's own content-based probing
+// —normally reliable — is left to identify the real container itself.
 function ffmpegFormatForMime(mimeType) {
   const m = (mimeType || '').toLowerCase();
   if (m.includes('mp4')) return { ext: 'mp4', format: 'mp4' };
   if (m.includes('ogg')) return { ext: 'ogg', format: 'ogg' };
-  return { ext: 'webm', format: 'webm' };
+  if (m.includes('webm')) return { ext: 'webm', format: 'webm' };
+  return { ext: 'audio', format: null };
 }
 
 // Joins the calibration clip (tutor speaking alone) in front of the actual
@@ -69,10 +72,12 @@ async function concatToOgg(calibrationBuffer, chunkBuffer, mimeType) {
   await fs.promises.writeFile(calPath, calibrationBuffer);
   await fs.promises.writeFile(chunkPath, chunkBuffer);
   try {
+    const inputArgs = format
+      ? ['-f', format, '-i', calPath, '-f', format, '-i', chunkPath]
+      : ['-i', calPath, '-i', chunkPath];
     await runFfmpeg([
       '-y',
-      '-f', format, '-i', calPath,
-      '-f', format, '-i', chunkPath,
+      ...inputArgs,
       '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[out]',
       '-map', '[out]',
       '-c:a', 'libopus',
