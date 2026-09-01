@@ -122,6 +122,20 @@ function allWords(response) {
   return words;
 }
 
+// Some model/config combinations return a transcript without per-word
+// timing/speaker data (words comes back empty even though speech was
+// recognized) — that used to mean the whole chunk silently produced
+// nothing. Falls back to the plain transcript text, unattributed to a
+// speaker, so at least something shows up instead of a blank session.
+function allResultsText(response) {
+  const texts = [];
+  for (const result of response.results || []) {
+    const alt = result.alternatives && result.alternatives[0];
+    if (alt && alt.transcript && alt.transcript.trim()) texts.push(alt.transcript.trim());
+  }
+  return texts;
+}
+
 // Words up to ~calibrationMs belong to the calibration clip. Whichever
 // speaker tag dominates that window is the tutor; everything after is
 // relabeled tutor/student and re-based to start at 0 for the real chunk.
@@ -211,7 +225,13 @@ module.exports = async (req, res) => {
     const oggBuffer = await concatToOgg(calibration, chunk);
     const response = await recognize({ apiKey, audioBytes: oggBuffer, maxSpeakers });
     const words = allWords(response);
-    const { segments, tutorTagFound } = splitAndLabel(words, calibrationMsHeader);
+    let segments, tutorTagFound;
+    if (words.length) {
+      ({ segments, tutorTagFound } = splitAndLabel(words, calibrationMsHeader));
+    } else {
+      segments = allResultsText(response).map((text) => ({ role: null, text }));
+      tutorTagFound = false;
+    }
 
     return res.status(200).json({ segments, tutorTagFound });
   } catch (err) {
