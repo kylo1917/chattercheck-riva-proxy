@@ -53,6 +53,7 @@ function runFfmpeg(args) {
 // —normally reliable — is left to identify the real container itself.
 function ffmpegFormatForMime(mimeType) {
   const m = (mimeType || '').toLowerCase();
+  if (m.includes('wav')) return { ext: 'wav', format: 'wav' };
   if (m.includes('mp4')) return { ext: 'mp4', format: 'mp4' };
   if (m.includes('ogg')) return { ext: 'ogg', format: 'ogg' };
   if (m.includes('webm')) return { ext: 'webm', format: 'webm' };
