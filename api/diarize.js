@@ -43,22 +43,36 @@ function runFfmpeg(args) {
   });
 }
 
+// Chrome sends WebM/Opus, but WebKit-based browsers (including the desktop
+// app) can't produce that container, so the client now says what it
+// actually sent. Naming the temp file with the right extension and forcing
+// ffmpeg's demuxer via -f matters: guessing wrong made ffmpeg exit cleanly
+// but silently produce a zero-sample output, which Riva then rejected with
+// an opaque "0 time steps" error instead of a clear failure.
+function ffmpegFormatForMime(mimeType) {
+  const m = (mimeType || '').toLowerCase();
+  if (m.includes('mp4')) return { ext: 'mp4', format: 'mp4' };
+  if (m.includes('ogg')) return { ext: 'ogg', format: 'ogg' };
+  return { ext: 'webm', format: 'webm' };
+}
+
 // Joins the calibration clip (tutor speaking alone) in front of the actual
 // chunk, re-encoding both into a single Ogg/Opus stream so Riva sees one
 // continuous recording. Re-encoding (not stream-copy) is required for concat.
-async function concatToOgg(calibrationBuffer, chunkBuffer) {
+async function concatToOgg(calibrationBuffer, chunkBuffer, mimeType) {
   const tmpDir = os.tmpdir();
   const id = crypto.randomBytes(8).toString('hex');
-  const calPath = path.join(tmpDir, `${id}-cal.webm`);
-  const chunkPath = path.join(tmpDir, `${id}-chunk.webm`);
+  const { ext, format } = ffmpegFormatForMime(mimeType);
+  const calPath = path.join(tmpDir, `${id}-cal.${ext}`);
+  const chunkPath = path.join(tmpDir, `${id}-chunk.${ext}`);
   const outPath = path.join(tmpDir, `${id}-out.ogg`);
   await fs.promises.writeFile(calPath, calibrationBuffer);
   await fs.promises.writeFile(chunkPath, chunkBuffer);
   try {
     await runFfmpeg([
       '-y',
-      '-i', calPath,
-      '-i', chunkPath,
+      '-f', format, '-i', calPath,
+      '-f', format, '-i', chunkPath,
       '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[out]',
       '-map', '[out]',
       '-c:a', 'libopus',
@@ -199,7 +213,7 @@ const { enforceOrigin, rateLimited } = require('./_shared');
 module.exports = async (req, res) => {
   if (!enforceOrigin(req, res)) return;
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Nvidia-Api-Key, X-Max-Speakers, X-Calibration-Duration-Ms');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Nvidia-Api-Key, X-Max-Speakers, X-Calibration-Duration-Ms, X-Audio-Mime-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
   if (rateLimited(req)) return res.status(429).json({ error: 'Too many requests — slow down a little' });
@@ -222,7 +236,8 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'X-Calibration-Duration-Ms header is required' });
     }
 
-    const oggBuffer = await concatToOgg(calibration, chunk);
+    const mimeType = req.headers['x-audio-mime-type'] || '';
+    const oggBuffer = await concatToOgg(calibration, chunk, mimeType);
     const response = await recognize({ apiKey, audioBytes: oggBuffer, maxSpeakers });
     const words = allWords(response);
     let segments, tutorTagFound;
